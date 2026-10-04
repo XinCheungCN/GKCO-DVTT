@@ -1,0 +1,40 @@
+seed: 42
+device: cuda
+verbose: true
+output_dir: outputs/pump
+
+dataset:
+  name: axial_flow_pump
+  root: data/axial_flow_pump
+  num_classes: 6
+  sample_length: 1024
+
+graph:
+  k_original: 4
+  k_positive: 1
+  k_negative: 1
+  k_optimized: 4
+
+gcva:
+  encoder_hidden: 256
+  latent_dim: 128
+  decoder_hidden: 256
+  learning_rate: 0.0075
+  epochs: 200
+  contrastive_margin: 1.0
+  dropout: 0.01
+
+dvtt:
+  hidden_dim: 128
+  mlp_dim: 32
+  num_dveb: 3
+  nhead: 4
+  learning_rate: 0.001
+  epochs: 500
+  dropout: 0.01
+
+preprocessing:
+  noise:
+    enabled: false
+    snr_db: 10
+    seed: 42
