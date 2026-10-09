@@ -1,6 +1,6 @@
 # GKCO-DVTT
 
-**(https://doi.org/10.1016/j.ress.2026.112593)**, published in *Reliability Engineering & System Safety*, 272 (2026), 112593.
+Official implementation of **[Plug-and-play graph reliability enhancement method for equipment state description under sparse information](https://doi.org/10.1016/j.ress.2026.112593)**, published in *Reliability Engineering & System Safety*, 272 (2026), 112593.
 
 ## Framework
 
@@ -48,7 +48,7 @@ BJTU-RAO:
 python scripts/run_pipeline.py --config configs/bjtu_rao.yaml
 ```
 
-Gaussian-noise evaluation can be enabled directly in the corresponding configuration file.
+Note: This implementation uses an unnormalized GKCO loss, whereas Eq. (9) in the paper describes initial-value normalization.
 
 ## Citation
 

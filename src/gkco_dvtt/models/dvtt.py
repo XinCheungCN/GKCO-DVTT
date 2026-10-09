@@ -2,81 +2,314 @@ import torch
 import torch.nn.functional as F
 
 
-class WeightedGraphSAGE(torch.nn.Module):
-    def __init__(self, dim: int, dropout: float = 0.01):
+class GraphSAGE(torch.nn.Module):
+
+    def __init__(
+        self,
+        in_feats,
+        out_feats,
+        dropout=0.0,
+    ):
         super().__init__()
-        self.fc_self = torch.nn.Linear(dim, dim, bias=False)
-        self.fc_neigh = torch.nn.Linear(dim, dim, bias=False)
-        self.norm = torch.nn.LayerNorm(dim)
-        self.dropout = torch.nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, weighted_adj: torch.Tensor) -> torch.Tensor:
-        row_sum = weighted_adj.sum(dim=1, keepdim=True).clamp_min(1e-12)
-        neigh = (weighted_adj @ x) / row_sum
-        out = self.fc_self(x) + self.fc_neigh(neigh)
-        return self.norm(self.dropout(F.relu(out)))
-
-
-class DVEB(torch.nn.Module):
-    def __init__(self, hidden_dim: int, nhead: int, dropout: float):
-        super().__init__()
-        self.transformer = torch.nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=nhead,
-            dim_feedforward=hidden_dim,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
+        self.fc_self = torch.nn.Linear(
+            in_feats,
+            out_feats,
+            bias=False,
         )
-        self.graphsage = WeightedGraphSAGE(hidden_dim, dropout)
 
-    def forward(self, x: torch.Tensor, weighted_adj: torch.Tensor) -> torch.Tensor:
-        x = self.transformer(x.unsqueeze(0)).squeeze(0)
-        return self.graphsage(x, weighted_adj)
+        self.fc_neigh = torch.nn.Linear(
+            in_feats,
+            out_feats,
+            bias=False,
+        )
+
+        self.dropout = torch.nn.Dropout(
+            dropout
+        )
+
+        self.layer_norm = torch.nn.LayerNorm(
+            out_feats
+        )
+
+    def forward(
+        self,
+        x,
+        adj,
+    ):
+        """
+        x:
+            [N, F]
+
+        adj:
+            [N, N]
+        """
+
+        adj = adj.float()
+
+        degree = adj.sum(
+            dim=1,
+            keepdim=True,
+        )
+
+        degree = torch.clamp(
+            degree,
+            min=1e-12,
+        )
+
+        neighbor_features = (
+            torch.matmul(
+                adj,
+                x,
+            )
+            / degree
+        )
+
+        self_features = (
+            self.fc_self(x)
+        )
+
+        neighbor_features = (
+            self.fc_neigh(
+                neighbor_features
+            )
+        )
+
+        out = (
+            self_features
+            + neighbor_features
+        )
+
+        out = F.relu(out)
+
+        out = self.dropout(out)
+
+        out = self.layer_norm(out)
+
+        return out
 
 
 class DVTT(torch.nn.Module):
+
     def __init__(
         self,
-        feature_dim: int,
-        num_nodes: int,
-        hidden_dim: int,
-        mlp_dim: int,
-        num_classes: int,
-        num_dveb: int = 3,
-        nhead: int = 4,
-        dropout: float = 0.01,
+        feature_dim_size,
+        num_nodes,
+        hidden_size,
+        hidden_size2,
+        num_classes,
+        num_self_att_layers=1,
+        num_gnn_layers=3,
+        nhead=4,
+        dropout=0.01,
     ):
         super().__init__()
-        self.node_encoder = torch.nn.Linear(feature_dim, hidden_dim)
-        self.topology_encoder = torch.nn.Linear(num_nodes, hidden_dim)
-        self.sequence_position = torch.nn.Parameter(torch.empty(num_nodes, hidden_dim))
-        torch.nn.init.xavier_uniform_(self.sequence_position)
 
-        self.blocks = torch.nn.ModuleList([
-            DVEB(hidden_dim, nhead=nhead, dropout=dropout) for _ in range(num_dveb)
-        ])
+        self.num_gnn_layers = (
+            num_gnn_layers
+        )
 
-        self.soft_attention = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.norm = torch.nn.LayerNorm(hidden_dim)
-        self.mlp = torch.nn.Linear(hidden_dim, mlp_dim)
-        self.dropout = torch.nn.Dropout(dropout)
-        self.classifier = torch.nn.Linear(mlp_dim, num_classes)
+        # Layer 1: dual encoding
 
-    def forward(self, node_features: torch.Tensor, weighted_adj: torch.Tensor) -> torch.Tensor:
-        topology_encoding = self.topology_encoder(weighted_adj)
-        x = self.node_encoder(node_features) + topology_encoding + self.sequence_position
+        self.feature_embedding = (
+            torch.nn.Linear(
+                feature_dim_size,
+                hidden_size,
+            )
+        )
 
-        for block in self.blocks:
-            x = block(x, weighted_adj)
+        # Topology encoding f_t(A_i)
+        self.topology_embedding = (
+            torch.nn.Linear(
+                num_nodes,
+                hidden_size,
+            )
+        )
 
-        gate = torch.sigmoid(self.soft_attention(x))
-        x = self.norm(gate * x)
-        x = F.gelu(self.mlp(x))
+        # Learnable sequence-position encoding
+        self.position_embedding = (
+            torch.nn.Parameter(
+                torch.zeros(
+                    num_nodes,
+                    hidden_size,
+                )
+            )
+        )
 
-        # The paper combines sum- and max-pooling views before the FC layer.
-        # Keeping a singleton view dimension preserves node-wise classification.
-        views = x.unsqueeze(1)
-        pooled = torch.sum(views, dim=1) + torch.amax(views, dim=1)
-        pooled = self.dropout(pooled)
-        return self.classifier(pooled)
+        torch.nn.init.xavier_uniform_(
+            self.position_embedding
+        )
+
+        # Layer 2: DVEBs
+
+        self.transformer_layers = (
+            torch.nn.ModuleList()
+        )
+
+        self.graphsage_layers = (
+            torch.nn.ModuleList()
+        )
+
+        for _ in range(
+            num_gnn_layers
+        ):
+
+            encoder_layer = (
+                torch.nn.TransformerEncoderLayer(
+                    d_model=hidden_size,
+                    nhead=nhead,
+                    dim_feedforward=hidden_size,
+                    dropout=dropout,
+                    batch_first=True,
+                )
+            )
+
+            transformer = (
+                torch.nn.TransformerEncoder(
+                    encoder_layer,
+                    num_layers=(
+                        num_self_att_layers
+                    ),
+                )
+            )
+
+            self.transformer_layers.append(
+                transformer
+            )
+
+            self.graphsage_layers.append(
+                GraphSAGE(
+                    hidden_size,
+                    hidden_size,
+                    dropout=dropout,
+                )
+            )
+
+        # Layer 3: soft attention + MLP
+
+        self.soft_attention = (
+            torch.nn.Linear(
+                hidden_size,
+                1,
+            )
+        )
+
+        self.layer_norm = (
+            torch.nn.LayerNorm(
+                hidden_size
+            )
+        )
+
+        self.mlp = torch.nn.Linear(
+            hidden_size,
+            hidden_size2,
+        )
+
+        self.dropout = torch.nn.Dropout(
+            dropout
+        )
+
+        self.classifier = torch.nn.Linear(
+            hidden_size2,
+            num_classes,
+        )
+
+    def forward(
+        self,
+        inputs,
+        adj,
+        weights,
+    ):
+
+        # Layer 1
+
+        node_features = (
+            self.feature_embedding(
+                inputs
+            )
+        )
+
+        topology_features = (
+            self.topology_embedding(
+                weights.float()
+            )
+        )
+
+        x = (
+            node_features
+            + topology_features
+            + self.position_embedding
+        )
+
+        # Layer 2: three DVEBs
+
+        for i in range(
+            self.num_gnn_layers
+        ):
+
+            # Transformer expects:
+            # [batch, sequence, feature]
+            transformer_input = (
+                x.unsqueeze(0)
+            )
+
+            transformer_output = (
+                self.transformer_layers[i](
+                    transformer_input
+                )
+            )
+
+            x = transformer_output.squeeze(
+                0
+            )
+
+            x = self.graphsage_layers[i](
+                x,
+                adj,
+            )
+
+        # Layer 3: soft attention
+
+        attention = torch.sigmoid(
+            self.soft_attention(x)
+        )
+
+        x = self.layer_norm(
+            attention * x
+        )
+
+        x = self.mlp(x)
+
+        x = F.gelu(x)
+
+        # Dual pooling
+
+        pooling_input = x.unsqueeze(1)
+
+        sum_pooling = torch.sum(
+            pooling_input,
+            dim=1,
+        )
+
+        max_pooling = torch.amax(
+            pooling_input,
+            dim=1,
+        )
+
+        graph_embeddings = (
+            sum_pooling
+            + max_pooling
+        )
+
+        graph_embeddings = self.dropout(
+            graph_embeddings
+        )
+
+        logits = self.classifier(
+            graph_embeddings
+        )
+
+        return F.log_softmax(
+            logits,
+            dim=-1,
+        )

@@ -1,13 +1,10 @@
-seed: 42
-device: cuda
-verbose: true
-output_dir: outputs/bjtu_rao
+experiment:
+  name: bjtu_rao
+  seed: 42
 
 dataset:
-  name: bjtu_rao
   root: data/bjtu_rao
   num_classes: 5
-  sample_length: 512
 
 graph:
   k_original: 7
@@ -16,25 +13,21 @@ graph:
   k_optimized: 7
 
 gcva:
-  encoder_hidden: 128
+  hidden_dim: 128
   latent_dim: 64
   decoder_hidden: 128
+  dropout: 0.01
+  lambda_reg: 0.001
+  beta: 1.0
   learning_rate: 0.0075
   epochs: 500
-  contrastive_margin: 1.0
-  dropout: 0.01
 
 dvtt:
   hidden_dim: 128
-  mlp_dim: 32
-  num_dveb: 3
+  mlp_hidden_dim: 32
+  num_self_att_layers: 1
+  num_gnn_layers: 3
   nhead: 4
+  dropout: 0.01
   learning_rate: 0.001
   epochs: 500
-  dropout: 0.01
-
-preprocessing:
-  noise:
-    enabled: false
-    snr_db: 10
-    seed: 42

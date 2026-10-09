@@ -1,62 +1,193 @@
-from dataclasses import dataclass
+from typing import Tuple
 
 import numpy as np
 import torch
+from scipy.fft import fft
 from sklearn.metrics.pairwise import euclidean_distances
-from torch_geometric.data import Data
 
 
-@dataclass
-class GraphTriplet:
-    original: Data
-    positive: Data
-    negative: Data
+def _ensure_2d(samples: np.ndarray) -> np.ndarray:
+    samples = np.asarray(samples)
+
+    if samples.ndim == 1:
+        samples = samples.reshape(1, -1)
+
+    if samples.ndim > 2:
+        samples = samples.reshape(samples.shape[0], -1)
+
+    return samples
 
 
-def half_spectrum(samples: np.ndarray) -> np.ndarray:
-    spectrum = np.abs(np.fft.fft(samples, axis=1))
-    return spectrum[:, : samples.shape[1] // 2].astype(np.float32)
+def fft_half_spectrum(samples: np.ndarray) -> np.ndarray:
+    """
+    Convert raw signals to half-spectrum FFT features.
+    """
+    samples = _ensure_2d(samples)
+
+    fft_features = np.abs(fft(samples, axis=1))
+    half_length = samples.shape[1] // 2
+
+    return fft_features[:, :half_length].astype(np.float32)
 
 
-def _edge_index_from_neighbors(neighbors: np.ndarray) -> torch.Tensor:
-    sources = np.repeat(np.arange(neighbors.shape[0]), neighbors.shape[1])
-    targets = neighbors.reshape(-1)
-    return torch.tensor(np.stack([sources, targets]), dtype=torch.long)
+def _neighbors_to_edge_index(neighbors: np.ndarray) -> torch.Tensor:
+    num_nodes, k = neighbors.shape
+
+    source = np.repeat(np.arange(num_nodes), k)
+    target = neighbors.reshape(-1)
+
+    edge_index = np.stack([source, target], axis=0)
+
+    return torch.tensor(edge_index, dtype=torch.long)
 
 
-def build_graph_triplet(features: np.ndarray, k_original: int, k_positive: int = 1, k_negative: int = 1) -> GraphTriplet:
-    distances = euclidean_distances(features)
-    nearest = np.argsort(distances, axis=1)
-    farthest = np.argsort(-distances, axis=1)
+def build_gkco_graphs(
+    node_features: np.ndarray,
+    k_original: int,
+    k_positive: int = 1,
+    k_negative: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Construct original, positive, and negative KNN graphs."""
+    distances = euclidean_distances(node_features)
 
-    original_neighbors = nearest[:, 1:1 + k_original]
-    positive_neighbors = nearest[:, 1:1 + k_positive]
-    negative_neighbors = farthest[:, :k_negative]
+    # Nearest-neighbor ranking
+    nearest_index = np.argsort(distances, axis=1)
 
-    x = torch.tensor(features, dtype=torch.float32)
-    return GraphTriplet(
-        original=Data(x=x, edge_index=_edge_index_from_neighbors(original_neighbors)),
-        positive=Data(x=x.clone(), edge_index=_edge_index_from_neighbors(positive_neighbors)),
-        negative=Data(x=x.clone(), edge_index=_edge_index_from_neighbors(negative_neighbors)),
+    original_neighbors = nearest_index[:, 1:1 + k_original]
+    positive_neighbors = nearest_index[:, 1:1 + k_positive]
+
+    farthest_index = np.argsort(-distances, axis=1)
+    negative_neighbors = farthest_index[:, 1:1 + k_negative]
+
+    edge_original = _neighbors_to_edge_index(original_neighbors)
+    edge_positive = _neighbors_to_edge_index(positive_neighbors)
+    edge_negative = _neighbors_to_edge_index(negative_neighbors)
+
+    return edge_original, edge_positive, edge_negative
+
+
+def build_rank_weighted_graph(
+    node_features: np.ndarray,
+    k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reconstruct a KNN graph with cosine-similarity edge weights."""
+
+    node_features = np.asarray(
+        node_features,
+        dtype=np.float32,
     )
 
+    num_nodes = node_features.shape[0]
 
-def build_weighted_optimized_graph(features: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rebuild KNN topology and compute row-normalized cosine-similarity edge weights."""
-    x_np = features.detach().cpu().numpy()
-    distances = euclidean_distances(x_np)
-    nearest = np.argsort(distances, axis=1)[:, 1:1 + k]
-    n = features.size(0)
+    # KNN topology reconstruction
 
-    adjacency = torch.zeros((n, n), dtype=features.dtype, device=features.device)
-    weighted_adjacency = torch.zeros_like(adjacency)
+    distances = euclidean_distances(
+        node_features
+    )
 
-    normalized = torch.nn.functional.normalize(features, p=2, dim=1)
-    for i in range(n):
-        nbr = torch.tensor(nearest[i], dtype=torch.long, device=features.device)
-        sims = torch.sum(normalized[i].unsqueeze(0) * normalized[nbr], dim=1)
-        weights = torch.softmax(sims, dim=0)
-        adjacency[i, nbr] = 1.0
-        weighted_adjacency[i, nbr] = weights
+    nearest_index = np.argsort(
+        distances,
+        axis=1,
+    )
 
-    return adjacency, weighted_adjacency
+    neighbors = nearest_index[
+        :,
+        1:1 + k,
+    ]
+
+    adjacency = np.zeros(
+        (num_nodes, num_nodes),
+        dtype=np.float32,
+    )
+
+    weights = np.zeros(
+        (num_nodes, num_nodes),
+        dtype=np.float32,
+    )
+
+    # Cosine-similarity edge weights
+
+    eps = 1e-12
+
+    norms = np.linalg.norm(
+        node_features,
+        axis=1,
+    )
+
+    for i in range(num_nodes):
+
+        neighbor_ids = neighbors[i]
+
+        similarities = []
+
+        for neighbor in neighbor_ids:
+
+            numerator = np.dot(
+                node_features[i],
+                node_features[neighbor],
+            )
+
+            denominator = (
+                norms[i]
+                * norms[neighbor]
+                + eps
+            )
+
+            similarity = (
+                numerator
+                / denominator
+            )
+
+            similarities.append(
+                similarity
+            )
+
+        similarities = np.asarray(
+            similarities,
+            dtype=np.float32,
+        )
+
+        # Numerically stable exp-normalization
+        similarities = (
+            similarities
+            - np.max(similarities)
+        )
+
+        exp_similarity = np.exp(
+            similarities
+        )
+
+        normalized_weights = (
+            exp_similarity
+            / (
+                np.sum(exp_similarity)
+                + eps
+            )
+        )
+
+        for j, neighbor in enumerate(
+            neighbor_ids
+        ):
+
+            weight = normalized_weights[j]
+
+            adjacency[
+                i,
+                neighbor,
+            ] = weight
+
+            weights[
+                i,
+                neighbor,
+            ] = weight
+
+    return (
+        torch.tensor(
+            adjacency,
+            dtype=torch.float32,
+        ),
+        torch.tensor(
+            weights,
+            dtype=torch.float32,
+        ),
+    )

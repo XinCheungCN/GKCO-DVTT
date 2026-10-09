@@ -1,75 +1,209 @@
-from dataclasses import dataclass
-
 import torch
 import torch.nn.functional as F
 
-from ..graph import GraphTriplet
-from ..models.gcva import GCVA, laplacian_regularization
+
+def gcva_loss(
+    recon_x,
+    x,
+    mu,
+    logvar,
+    laplacian_loss,
+    beta=1.0,
+):
+    """Compute reconstruction, KL, and Laplacian losses."""
+
+    reconstruction_loss = F.mse_loss(
+        recon_x,
+        x,
+        reduction="sum",
+    )
+
+    kl_loss = -0.5 * torch.sum(
+        1
+        + logvar
+        - mu.pow(2)
+        - logvar.exp()
+    )
+
+    total_loss = (
+        reconstruction_loss
+        + beta * kl_loss
+        + laplacian_loss
+    )
+
+    return total_loss
 
 
-@dataclass
-class LossTerms:
-    reconstruction: torch.Tensor
-    kl: torch.Tensor
-    laplacian: torch.Tensor
-    contrastive: torch.Tensor
+def contrastive_loss(
+    anchor,
+    positive,
+    negative,
+    margin=1.0,
+):
 
-
-def _contrastive_loss(z: torch.Tensor, z_pos: torch.Tensor, z_neg: torch.Tensor, margin: float) -> torch.Tensor:
-    pos_sim = F.cosine_similarity(z, z_pos, dim=1)
-    neg_sim = F.cosine_similarity(z, z_neg, dim=1)
-    return F.relu(pos_sim - neg_sim + margin).mean()
-
-
-def _loss_terms(model: GCVA, graphs: GraphTriplet, margin: float) -> tuple[LossTerms, torch.Tensor]:
-    recon, z, mu, logvar = model(graphs.original.x, graphs.original.edge_index)
-    _, z_pos, _, _ = model(graphs.positive.x, graphs.positive.edge_index)
-    _, z_neg, _, _ = model(graphs.negative.x, graphs.negative.edge_index)
-
-    reconstruction = F.mse_loss(recon, graphs.original.x, reduction="sum")
-    kl = -0.5 * torch.sum(1.0 + logvar - mu.pow(2) - logvar.exp())
-    laplacian = laplacian_regularization(mu, graphs.original.edge_index, graphs.original.num_nodes)
-    contrastive = _contrastive_loss(z, z_pos, z_neg, margin)
-    return LossTerms(reconstruction, kl, laplacian, contrastive), recon
-
-
-def _normalizers(terms: LossTerms) -> dict[str, torch.Tensor]:
-    eps = 1e-12
-    return {
-        "reconstruction": terms.reconstruction.detach().abs().clamp_min(eps),
-        "kl": terms.kl.detach().abs().clamp_min(eps),
-        "laplacian": terms.laplacian.detach().abs().clamp_min(eps),
-        "contrastive": terms.contrastive.detach().abs().clamp_min(eps),
-    }
-
-
-def train_gcva(model: GCVA, graphs: GraphTriplet, lr: float, epochs: int, margin: float, verbose: bool = True) -> list[float]:
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    model.train()
-    initial_terms, _ = _loss_terms(model, graphs, margin)
-    norm = _normalizers(initial_terms)
-    history = []
-
-    for epoch in range(1, epochs + 1):
-        optimizer.zero_grad()
-        terms, _ = _loss_terms(model, graphs, margin)
-        loss = (
-            terms.reconstruction / norm["reconstruction"]
-            + terms.kl / norm["kl"]
-            + terms.laplacian / norm["laplacian"]
-            + terms.contrastive / norm["contrastive"]
+    positive_similarity = (
+        F.cosine_similarity(
+            anchor,
+            positive,
         )
-        loss.backward()
+    )
+
+    negative_similarity = (
+        F.cosine_similarity(
+            anchor,
+            negative,
+        )
+    )
+
+    loss = F.relu(
+        positive_similarity
+        - negative_similarity
+        + margin
+    )
+
+    return loss.mean()
+
+
+def train_gkco(
+    model,
+    data_original,
+    data_positive,
+    data_negative,
+    optimizer,
+    epochs,
+    device,
+    beta=1.0,
+    log_every=25,
+):
+
+    data_original = data_original.to(
+        device
+    )
+
+    data_positive = data_positive.to(
+        device
+    )
+
+    data_negative = data_negative.to(
+        device
+    )
+
+    for epoch in range(
+        1,
+        epochs + 1,
+    ):
+
+        model.train()
+        optimizer.zero_grad()
+
+        (
+            recon_original,
+            mu_original,
+            logvar_original,
+            laplacian_original,
+        ) = model(
+            data_original.x,
+            data_original.edge_index,
+        )
+
+        (
+            _,
+            mu_positive,
+            _,
+            _,
+        ) = model(
+            data_positive.x,
+            data_positive.edge_index,
+        )
+
+        (
+            _,
+            mu_negative,
+            _,
+            _,
+        ) = model(
+            data_negative.x,
+            data_negative.edge_index,
+        )
+
+        loss_original = gcva_loss(
+            recon_original,
+            data_original.x,
+            mu_original,
+            logvar_original,
+            laplacian_original,
+            beta=beta,
+        )
+
+        loss_contrastive = (
+            contrastive_loss(
+                mu_original,
+                mu_positive,
+                mu_negative,
+            )
+        )
+
+        total_loss = (
+            loss_original
+            + loss_contrastive
+        )
+
+        total_loss.backward()
         optimizer.step()
-        value = float(loss.detach().cpu())
-        history.append(value)
-        if verbose and (epoch == 1 or epoch % 25 == 0 or epoch == epochs):
-            print(f"[GKCO] epoch {epoch:04d}/{epochs}  loss={value:.6f}")
-    return history
+
+        if (
+            epoch == 1
+            or epoch % log_every == 0
+            or epoch == epochs
+        ):
+            print(
+                "[GKCO] "
+                "epoch "
+                "{:04d}/{:04d}  "
+                "loss={:.6f}".format(
+                    epoch,
+                    epochs,
+                    total_loss.item(),
+                )
+            )
 
 
 @torch.no_grad()
-def optimize_node_features(model: GCVA, original_graph) -> torch.Tensor:
+def reconstruct_features(
+    model,
+    data_original,
+    device,
+):
+
     model.eval()
-    recon, _, _, _ = model(original_graph.x, original_graph.edge_index)
-    return recon
+
+    data_original = (
+        data_original.to(device)
+    )
+
+    mu, logvar = model.encoder(
+        data_original.x,
+        data_original.edge_index,
+    )
+
+    (
+        mu,
+        logvar,
+        _,
+    ) = model.latent_layer(
+        mu,
+        logvar,
+        data_original.edge_index,
+    )
+
+    z = model.reparameterize(
+        mu,
+        logvar,
+    )
+
+    decoded_features = model.decoder(
+        z,
+        data_original.edge_index,
+    )
+
+    return decoded_features

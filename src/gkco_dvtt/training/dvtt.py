@@ -1,75 +1,211 @@
-from dataclasses import dataclass
+import copy
 
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, f1_score
-
-from ..models.dvtt import DVTT
+from sklearn.metrics import f1_score
 
 
-@dataclass
-class DVTTResult:
-    best_val_accuracy: float
-    test_accuracy: float
-    test_f1_weighted: float
-    best_epoch: int
+def _accuracy(
+    logits,
+    labels,
+    mask,
+):
 
+    prediction = (
+        logits[mask]
+        .max(1)[1]
+    )
 
-@torch.no_grad()
-def _accuracy(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> float:
-    pred = logits[mask].argmax(dim=1)
-    return float((pred == labels[mask]).float().mean().item())
+    correct = (
+        prediction
+        .eq(labels[mask])
+        .sum()
+        .item()
+    )
+
+    total = (
+        mask.sum().item()
+    )
+
+    if total == 0:
+        return 0.0
+
+    return correct / total
 
 
 def train_dvtt(
-    model: DVTT,
-    node_features: torch.Tensor,
-    weighted_adj: torch.Tensor,
-    labels: torch.Tensor,
-    train_mask: torch.Tensor,
-    val_mask: torch.Tensor,
-    test_mask: torch.Tensor,
-    lr: float,
-    epochs: int,
-    verbose: bool = True,
-) -> DVTTResult:
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    best_state = None
-    best_val = -1.0
+    model,
+    features,
+    labels,
+    adjacency,
+    weights,
+    train_mask,
+    val_mask,
+    test_mask,
+    learning_rate,
+    epochs,
+    device,
+    log_every=50,
+):
+
+    model = model.to(device)
+
+    features = features.to(device)
+    labels = labels.to(device)
+
+    adjacency = adjacency.to(device)
+    weights = weights.to(device)
+
+    train_mask = train_mask.to(device)
+    val_mask = val_mask.to(device)
+    test_mask = test_mask.to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=learning_rate,
+    )
+
+    best_validation_accuracy = -1.0
+    best_test_accuracy = 0.0
+    best_test_f1 = 0.0
     best_epoch = 0
 
-    for epoch in range(1, epochs + 1):
+    best_state = None
+
+    for epoch in range(
+        1,
+        epochs + 1,
+    ):
+
         model.train()
+
         optimizer.zero_grad()
-        logits = model(node_features, weighted_adj)
-        loss = F.cross_entropy(logits[train_mask], labels[train_mask])
+
+        logits = model(
+            features,
+            adjacency,
+            weights,
+        )
+
+        loss = F.nll_loss(
+            logits[train_mask],
+            labels[train_mask],
+        )
+
         loss.backward()
+
         optimizer.step()
 
         model.eval()
-        with torch.no_grad():
-            logits = model(node_features, weighted_adj)
-            val_acc = _accuracy(logits, labels, val_mask)
-        if val_acc > best_val:
-            best_val = val_acc
-            best_epoch = epoch
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-        if verbose and (epoch == 1 or epoch % 50 == 0 or epoch == epochs):
-            print(f"[DVTT] epoch {epoch:04d}/{epochs}  loss={float(loss):.6f}  val_acc={val_acc:.4f}")
+        with torch.no_grad():
+
+            logits = model(
+                features,
+                adjacency,
+                weights,
+            )
+
+            validation_accuracy = (
+                _accuracy(
+                    logits,
+                    labels,
+                    val_mask,
+                )
+            )
+
+            test_accuracy = (
+                _accuracy(
+                    logits,
+                    labels,
+                    test_mask,
+                )
+            )
+
+            test_prediction = (
+                logits[test_mask]
+                .max(1)[1]
+                .cpu()
+                .numpy()
+            )
+
+            test_labels = (
+                labels[test_mask]
+                .cpu()
+                .numpy()
+            )
+
+            test_f1 = f1_score(
+                test_labels,
+                test_prediction,
+                average="weighted",
+            )
+
+        if (
+            validation_accuracy
+            > best_validation_accuracy
+        ):
+
+            best_validation_accuracy = (
+                validation_accuracy
+            )
+
+            best_test_accuracy = (
+                test_accuracy
+            )
+
+            best_test_f1 = (
+                test_f1
+            )
+
+            best_epoch = epoch
+
+            best_state = copy.deepcopy(
+                model.state_dict()
+            )
+
+        if (
+            epoch == 1
+            or epoch % log_every == 0
+            or epoch == epochs
+        ):
+
+            print(
+                "[DVTT] "
+                "epoch "
+                "{:04d}/{:04d}  "
+                "loss={:.6f}  "
+                "val_acc={:.4f}".format(
+                    epoch,
+                    epochs,
+                    loss.item(),
+                    validation_accuracy,
+                )
+            )
 
     if best_state is not None:
-        model.load_state_dict(best_state)
+        model.load_state_dict(
+            best_state
+        )
 
-    model.eval()
-    with torch.no_grad():
-        logits = model(node_features, weighted_adj)
-        pred = logits[test_mask].argmax(dim=1).cpu().numpy()
-        true = labels[test_mask].cpu().numpy()
+    return {
+        "best_validation_accuracy":
+            float(
+                best_validation_accuracy
+            ),
 
-    return DVTTResult(
-        best_val_accuracy=best_val,
-        test_accuracy=float(accuracy_score(true, pred)),
-        test_f1_weighted=float(f1_score(true, pred, average="weighted")),
-        best_epoch=best_epoch,
-    )
+        "test_accuracy":
+            float(
+                best_test_accuracy
+            ),
+
+        "test_f1_weighted":
+            float(
+                best_test_f1
+            ),
+
+        "best_epoch":
+            int(
+                best_epoch
+            ),
+    }
