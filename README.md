@@ -1,6 +1,6 @@
 # GKCO-DVTT
 
-Official implementation of **[Plug-and-play graph reliability enhancement method for equipment state description under sparse information](https://doi.org/10.1016/j.ress.2026.112593)**, published in *Reliability Engineering & System Safety*, 272 (2026), 112593.
+**[Plug-and-play graph reliability enhancement method for equipment state description under sparse information](https://doi.org/10.1016/j.ress.2026.112593)**, published in *Reliability Engineering & System Safety*, 272 (2026), 112593.
 
 ## Framework
 
